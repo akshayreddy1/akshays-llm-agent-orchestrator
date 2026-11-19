@@ -14,7 +14,7 @@ import tools
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
