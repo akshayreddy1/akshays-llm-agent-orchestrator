@@ -82,6 +82,13 @@ def orchestrate_agent(query: str, history: List[Dict[str, str]]) -> dict:
     logger.info(f"Orchestrating with LLM ({MODEL_NAME}) for query: {query}")
     llm_choice_str = "" 
 
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return {
+            "query": query,
+            "result": "Configuration Error: `GROQ_API_KEY` is not set. Please check your Vercel Environment Variables and verify 'Production' is checked."
+        }
+
     try:
         tools_json_string = json.dumps([{name: props['description'], 'args': props['args']} for name, props in AVAILABLE_TOOLS.items()], indent=2)
         prompt_with_tools = SYSTEM_PROMPT.format(tools_json=tools_json_string)
@@ -90,7 +97,7 @@ def orchestrate_agent(query: str, history: List[Dict[str, str]]) -> dict:
 
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}"},
+            headers={"Authorization": f"Bearer {api_key.strip()}"},
             json={ "model": MODEL_NAME, "messages": messages, "temperature": 0.0, "response_format": {"type": "json_object"} }
         )
         response.raise_for_status()
@@ -112,7 +119,7 @@ def orchestrate_agent(query: str, history: List[Dict[str, str]]) -> dict:
             direct_response_payload = { "model": MODEL_NAME, "messages": fallback_messages }
             direct_response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}"},
+                headers={"Authorization": f"Bearer {api_key.strip()}"},
                 json=direct_response_payload
             )
             direct_response.raise_for_status()
@@ -121,32 +128,27 @@ def orchestrate_agent(query: str, history: List[Dict[str, str]]) -> dict:
         else:
             return {"query": query, "result": f"Error: The LLM chose a tool ('{tool_name}') that does not exist."}
     
-    # --- THE FIX IS HERE ---
-    # This is our new, smart error handler.
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP Error from LLM: {e.response.text}")
         try:
-            # Try to parse the JSON error from the API
             error_details = e.response.json().get("error", {})
             error_code = error_details.get("code")
+            error_msg = error_details.get("message", e.response.text)
 
             if error_code == "rate_limit_exceeded":
-                message = error_details.get("message", "")
-                # Use regex to find the wait time
-                match = re.search(r"Please try again in (\d+\.?\d*)s", message)
-                if match:
-                    wait_time = math.ceil(float(match.group(1)))
-                    friendly_message = f"It looks like I'm a bit popular right now! Please wait about {wait_time} seconds and try again."
-                    return {"query": query, "result": friendly_message}
-                else:
-                    return {"query": query, "result": "I'm experiencing high traffic right now. Please try again in a moment."}
-        except (json.JSONDecodeError, AttributeError):
-            # If the error isn't the JSON we expect, give a generic but clean message
-            return {"query": query, "result": f"An API error occurred (Status Code: {e.response.status_code})."}
+                match = re.search(r"Please try again in (\d+\.?\d*)s", error_msg)
+                wait_time = math.ceil(float(match.group(1))) if match else 10
+                return {"query": query, "result": f"Rate limit reached. Please wait {wait_time}s and try again."}
+            elif error_code == "invalid_api_key":
+                return {"query": query, "result": f"Groq Authentication Error: {error_msg}. Please verify GROQ_API_KEY in Vercel."}
+            else:
+                return {"query": query, "result": f"Groq API Error ({e.response.status_code}): {error_msg}"}
+        except Exception:
+            return {"query": query, "result": f"API Error (Status {e.response.status_code}): {e.response.text}"}
             
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        return {"query": query, "result": f"An unexpected error occurred in the agent logic: {e}"}
+        return {"query": query, "result": f"Agent error: {e}"}
 
 
 @app.post("/orchestrate")
