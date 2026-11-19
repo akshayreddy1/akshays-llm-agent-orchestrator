@@ -50,23 +50,23 @@ AVAILABLE_TOOLS = {
     }
 }
 
-SYSTEM_PROMPT = """
-You are a smart, tool-using assistant. Your goal is to accurately determine the user's intent and select the appropriate tool.
+# Native tool calling definitions for Groq API
+GROQ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": prop["description"],
+            "parameters": {
+                "type": "object",
+                "properties": prop["args"],
+                "required": list(prop["args"].keys())
+            }
+        }
+    }
+    for name, prop in AVAILABLE_TOOLS.items()
+]
 
-Here is your thought process:
-1.  First, analyze the entire conversation history to understand the context.
-2.  Second, focus on the user's **latest query** to identify their primary, immediate intent.
-3.  Compare this intent against the descriptions of the available tools.
-
-Your Rules:
-- If the user's latest query CLEARLY and DIRECTLY matches the description of a tool, you MUST choose that tool. For example, queries about 'weather', 'climate', or 'forecast' should always use the 'get_weather' tool.
-- If the query is a conversational follow-up that does not explicitly ask for a tool (e.g., "why is that?", "tell me more", "how?"), or if no tool is a good fit, you MUST use the 'fallback' tool to continue the conversation.
-
-You must respond ONLY with a valid JSON object with 'tool_name' and 'arguments' keys.
-
-Here are the available tools:
-{tools_json}
-"""
 
 class QueryRequest(BaseModel):
     query: str
@@ -89,11 +89,9 @@ def get_active_model(api_key: str) -> tuple[str, list]:
             data = res.json().get("data", [])
             available = [m["id"] for m in data if not any(x in m.get("id", "").lower() for x in ["whisper", "guard"])]
             
-            # If user explicitly configured a model and it's valid, use it
             if configured and configured in available and "8b" not in configured:
                 return configured, available
             
-            # Auto-match against active Groq models
             preferences = [
                 "openai/gpt-oss-20b",
                 "openai/gpt-oss-120b",
@@ -110,7 +108,7 @@ def get_active_model(api_key: str) -> tuple[str, list]:
     except Exception as e:
         logger.error(f"Error checking available Groq models: {e}")
     
-    return "openai/gpt-oss-20b", []
+    return configured or "openai/gpt-oss-20b", []
 
 
 def orchestrate_agent(query: str, history: List[Dict[str, str]]) -> dict:
@@ -125,44 +123,50 @@ def orchestrate_agent(query: str, history: List[Dict[str, str]]) -> dict:
     logger.info(f"Orchestrating with LLM ({model_to_use}) for query: {query}")
 
     try:
-        tools_json_string = json.dumps([{name: props['description'], 'args': props['args']} for name, props in AVAILABLE_TOOLS.items()], indent=2)
-        prompt_with_tools = SYSTEM_PROMPT.format(tools_json=tools_json_string)
-        
-        messages = [{"role": "system", "content": prompt_with_tools}] + history + [{"role": "user", "content": query}]
+        system_instruction = (
+            "You are a helpful and intelligent multi-tool assistant. "
+            "Use the provided tools when the user's request requires live data or actions (such as checking weather, stock prices, news, Wikipedia, or math calculations). "
+            "If no tool is needed, respond directly with a helpful conversational answer."
+        )
+        messages = [{"role": "system", "content": system_instruction}] + history + [{"role": "user", "content": query}]
+
+        payload = {
+            "model": model_to_use,
+            "messages": messages,
+            "temperature": 0.0,
+            "tools": GROQ_TOOLS,
+            "tool_choice": "auto"
+        }
 
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key.strip()}"},
-            json={ "model": model_to_use, "messages": messages, "temperature": 0.0, "response_format": {"type": "json_object"} }
+            json=payload
         )
         response.raise_for_status()
-        llm_choice_str = response.json()['choices'][0]['message']['content']
-        llm_choice = json.loads(llm_choice_str)
-        
-        tool_name = llm_choice.get("tool_name")
-        arguments = llm_choice.get("arguments", {})
+        choice_msg = response.json()['choices'][0]['message']
 
-        logger.info(f"LLM chose tool: '{tool_name}' with arguments: {arguments}")
+        tool_calls = choice_msg.get("tool_calls")
+        if tool_calls:
+            first_call = tool_calls[0]["function"]
+            tool_name = first_call.get("name")
+            try:
+                arguments = json.loads(first_call.get("arguments", "{}"))
+            except Exception:
+                arguments = {}
 
-        if tool_name in AVAILABLE_TOOLS:
-            result = AVAILABLE_TOOLS[tool_name]["function"](**arguments)
-            return {"query": query, "result": result}
-        
-        elif tool_name == "fallback":
-            logger.info("No suitable tool found. Falling back to direct LLM call.")
-            fallback_messages = [{"role": "system", "content": "You are a helpful and conversational assistant."}] + history + [{"role": "user", "content": query}]
-            direct_response_payload = { "model": model_to_use, "messages": fallback_messages }
-            direct_response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key.strip()}"},
-                json=direct_response_payload
-            )
-            direct_response.raise_for_status()
-            return {"query": query, "result": direct_response.json()['choices'][0]['message']['content']}
-        
+            logger.info(f"LLM called tool: '{tool_name}' with arguments: {arguments}")
+
+            if tool_name in AVAILABLE_TOOLS:
+                result = AVAILABLE_TOOLS[tool_name]["function"](**arguments)
+                return {"query": query, "result": result}
+            else:
+                return {"query": query, "result": f"Error: The LLM chose a tool ('{tool_name}') that does not exist."}
         else:
-            return {"query": query, "result": f"Error: The LLM chose a tool ('{tool_name}') that does not exist."}
-    
+            # Direct conversational response
+            content = choice_msg.get("content", "")
+            return {"query": query, "result": content}
+
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP Error from LLM: {e.response.text}")
         try:
